@@ -4,6 +4,7 @@ import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import habana_frameworks.torch as htorch
 
 from vllm import envs
 
@@ -34,8 +35,8 @@ class HpuPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
                              dtype: torch.dtype, kv_cache_dtype: Optional[str],
-                             block_size: int, use_v1: bool,
-                             use_mla: bool) -> str:
+                             block_size: int, use_v1: bool, use_mla: bool,
+                             has_sink: bool) -> str:
         if use_v1 and not use_mla:
             logger.info("Using HPUAttentionV1 backend.")
             return "vllm_gaudi.attention.backends.hpu_attn.HPUAttentionBackend"
@@ -93,17 +94,20 @@ class HpuPlatform(Platform):
                     "VLLM_WORKER_MULTIPROC_METHOD=fork explicitly.")
                 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-        if vllm_config.model_config.dtype in (torch.float16, torch.float32):
+        if (vllm_config.model_config is not None
+                and vllm_config.model_config.dtype
+                in (torch.float16, torch.float32)):
             logger.warning(
-                "The TPU backend currently does not support %s. "
+                "The HPU backend currently does not support %s. "
                 "Using bfloat16 instead.", vllm_config.model_config.dtype)
             vllm_config.model_config.dtype = torch.bfloat16
 
         if envs.VLLM_USE_V1:
-            from vllm.config import CompilationLevel
+            from vllm.config import CompilationLevel, CUDAGraphMode
             compilation_config = vllm_config.compilation_config
             # Activate custom ops for v1.
             compilation_config.custom_ops = ["all"]
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
             if compilation_config.level != CompilationLevel.NO_COMPILATION:
                 logger.info("[HPU] Forcing CompilationLevel.NO_COMPILATION "
@@ -141,13 +145,17 @@ class HpuPlatform(Platform):
         # Eager backend (PT_HPU_LAZY_MODE = 0) must be selected for
         # torch.compile support
         os.environ['PT_HPU_WEIGHT_SHARING'] = '0'
-        is_lazy = os.environ.get('PT_HPU_LAZY_MODE', '1') == '1'
+        is_lazy = htorch.utils.internal.is_lazy()
         if is_lazy:
             torch._dynamo.config.disable = True
             # NOTE multi-HPU inference with HPUGraphs (lazy-only)
             # requires enabling lazy collectives
             # see https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html  # noqa: E501
             os.environ['PT_HPU_ENABLE_LAZY_COLLECTIVES'] = 'true'
+
+    @classmethod
+    def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str) -> bool:
+        return kv_cache_dtype == "fp8_inc"
 
     @classmethod
     def set_synchronized_weight_loader(cls) -> None:
